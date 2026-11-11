@@ -205,7 +205,43 @@ let quickOCRText='';
 function openQuick(){sheet('スクリーンショット速報値',`<p class="hint">画像は外部に送信しません。初回はOCRプログラムと日本語・英語認識データをネットワークから取得します。画像内の個人情報が読み取られる場合があるため、選択前に画像を確認してください。</p><label class="field">当日約定一覧の画像<input id="quickImage" type="file" accept="image/*" onchange="quickReadImage()"></label><p id="quickStatus" class="hint">初回のOCRデータ取得には時間がかかる場合があります。</p><label class="field">認識した文字（必要なら修正）<textarea id="quickText" rows="6" placeholder="画像を選択するとここに認識結果が表示されます"></textarea></label><button class="btn" onclick="quickParse()">文字から候補を抽出</button><hr class="line"><div id="quickPreview"></div><p class="hint">認識結果は必ず目視確認してください。持ち越し株や異なる取得単価がある場合は概算できません。</p>`)}
 async function loadOCR(){if(window.Tesseract)return;const url='https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js';await new Promise((resolve,reject)=>{let s=document.createElement('script');s.src=url;s.onload=resolve;s.onerror=()=>reject(Error('OCRライブラリの取得に失敗しました。インターネット接続を確認してください。'));document.head.appendChild(s)})}
 async function quickReadImage(){let f=$('#quickImage')?.files?.[0];if(!f)return;const status=$('#quickStatus');status.textContent='OCRの準備中です。初回は通信が必要です…';let worker=null;try{await loadOCR();status.textContent='画像を認識しています…';worker=await Tesseract.createWorker('jpn+eng',1,{logger:m=>{if(status&&document.contains(status))status.textContent='画像認識中：'+(m.status||'')+(m.progress?' '+Math.round(m.progress*100)+'%':'')}});let out=await worker.recognize(f);quickOCRText=out.data.text||'';if(!$('#quickText'))return;$('#quickText').value=quickOCRText;status.textContent='認識が完了しました。抽出結果を確認してください。';quickParse()}catch(e){if(status)status.textContent='OCRに失敗しました：'+e.message+'。下の入力欄で手入力できます。';quickParse()}finally{if(worker)await worker.terminate().catch(()=>{})}}
-function quickParse(){const raw=$('#quickText')?.value||'';const nums=[...raw.matchAll(/(?:\d{1,3},)?\d{2,4}(?:[.,]\d{1,2})?/g)].map(m=>m[0]);let code=(raw.match(/(?:^|\D)(1[35679]\d{2}|[2-9]\d{3})(?:\D|$)/m)||[])[1]||'';let prices=[...raw.matchAll(/(\d{2,5}[.,]\d{1,2})\s*円?/g)].map(x=>Number(x[1].replace(',','.'))).filter(x=>x>0);let buy=prices[0]||'',sell=prices[1]||'';let qty=(raw.match(/(?:約定株数|株数|数量)\s*([\d,]+)\s*株/)||[])[1]||'';let panel=$('#quickPreview');if(!panel)return;panel.innerHTML=`<form id="quickForm" onsubmit="saveQuick(event)"><label class="field">取引日<input name="date" type="date" required value="${today()}"></label><label class="field">銘柄コード<input name="code" inputmode="numeric" pattern="[0-9]{4,5}" required value="${esc(code)}" placeholder="1579"></label><label class="field">銘柄名（任意）<input name="name" value=""></label><label class="field">買付平均単価（円）<input name="buy" type="number" step="0.0001" min="0" required value="${esc(buy)}" placeholder="634.1"></label><label class="field">売却平均単価（円）<input name="sell" type="number" step="0.0001" min="0" required value="${esc(sell)}" placeholder="636.2"></label><label class="field">売却株数<input name="qty" type="number" step="1" min="1" required value="${esc(qty.replaceAll(',',''))}" placeholder="600"></label><label class="field">手数料（円）<input name="fee" type="number" step="1" min="0" value="0"></label><p id="quickCalc" class="hint">登録時に税引き後損益を計算します。利益時のみ税率20.315%で概算し、損失時の還付は含めません。</p><button type="submit" class="btn primary">確認して速報値を登録</button></form>`}
+function quickParse(){
+ const raw=$('#quickText')?.value||'',lines=raw.split(/\r?\n/).map(x=>x.trim()).filter(Boolean);
+ const code=(raw.match(/(?:^|[^0-9])([1-9][0-9]{3})(?=[^0-9]|$)/m)||[])[1]||'';
+ // Prefer the name from previously imported CSV records; OCR is the fallback.
+ const known=records.find(r=>String(r.code||'')===code&&r.name)?.name||'';
+ let name=known;
+ if(!name){
+   const nameLine=lines.find(x=>/日経.{0,8}(?:レバレッジ|ダブル)|(?:レバレッジ|ダブル).{0,6}日経/.test(x));
+   if(nameLine)name=nameLine.replace(/^\s*(?:1579|1360)\s*/, '').replace(/\s*(?:1579|1360)\s*$/, '').replace(/\s*(?:SOR|特定|一般|NISA|現買|現売).*$/,'').trim();
+ }
+ const commonNames={'1579':'日経レバレッジダブル','1360':'日経平均ベア2倍上場投信'};
+ if(!name&&commonNames[code])name=commonNames[code];
+ // OCR sometimes separates the heading, quantity, and average price into different lines.
+ // Look for all explicit N株 tokens; the sell-side quantity is preferred.
+ const qtyTokens=[...raw.matchAll(/([0-9][0-9,]*)\s*(?:株|株数)/g)].map(m=>Number(m[1].replaceAll(',',''))).filter(n=>n>0&&n<1e9);
+ let qty='';
+ const sellLine=lines.findIndex(x=>/現売|売却|売付|売り|現物売/.test(x));
+ if(sellLine>=0){
+   const window=lines.slice(Math.max(0,sellLine-2),Math.min(lines.length,sellLine+5)).join(' ');
+   const m=window.match(/([0-9][0-9,]*)\s*株/);if(m)qty=m[1].replaceAll(',','');
+ }
+ if(!qty&&qtyTokens.length)qty=String(qtyTokens[qtyTokens.length-1]);
+ if(!qty){
+   // Fallback for a table whose '約定株数' header and value are in different cells.
+   const idx=lines.findIndex(x=>/約定株数|約定数量|株数/.test(x));
+   if(idx>=0){const nearby=lines.slice(idx+1,idx+7).join(' ');const m=nearby.match(/(?:^|\s)([1-9][0-9,]{0,7})(?:\s|$)/);if(m)qty=m[1].replaceAll(',','')}
+ }
+ // For SBI's same-day execution list, use the decimal average prices in buy/sell order.
+ const prices=[...raw.matchAll(/([0-9]{2,5}[.,][0-9]{1,4})\s*円?/g)].map(m=>Number(m[1].replace(',','.'))).filter(n=>n>0);
+ let buy=prices[0]||'',sell=prices[1]||'';
+ const buyIdx=lines.findIndex(x=>/現買|買付|買い|現物買/.test(x));
+ const priceNear=(i)=>{if(i<0)return null;const text=lines.slice(i,Math.min(lines.length,i+5)).join(' ');const m=text.match(/([0-9]{2,5}[.,][0-9]{1,4})\s*円?/);return m?Number(m[1].replace(',','.')):null};
+ // Only use the side-aware match when both prices can be found unambiguously.
+ const bp=priceNear(buyIdx),sp=priceNear(sellLine);if(bp!==null&&sp!==null&&bp!==sp){buy=bp;sell=sp}
+ const panel=$('#quickPreview');if(!panel)return;
+ panel.innerHTML=`<form id="quickForm" onsubmit="saveQuick(event)"><label class="field">取引日<input name="date" type="date" required value="${today()}"></label><label class="field">銘柄コード<input name="code" inputmode="numeric" pattern="[0-9]{4,5}" required value="${esc(code)}" placeholder="1579"></label><label class="field">銘柄名（修正可）<input name="name" value="${esc(name)}" placeholder="銘柄名"></label><label class="field">買付平均単価（円）<input name="buy" type="number" step="0.0001" min="0" required value="${esc(buy)}" placeholder="634.1"></label><label class="field">売却平均単価（円）<input name="sell" type="number" step="0.0001" min="0" required value="${esc(sell)}" placeholder="636.2"></label><label class="field">売却株数<input name="qty" type="number" step="1" min="1" required value="${esc(qty)}" placeholder="600"></label><label class="field">手数料（円）<input name="fee" type="number" step="1" min="0" value="0"></label><p id="quickCalc" class="hint">認識値は必ず確認してください。税額は利益時のみ20.315%で概算し、還付金は日別損益に含めません。</p><button type="submit" class="btn primary">確認して速報値を登録</button></form>`;
+}
 async function saveQuick(e){e.preventDefault();const v=Object.fromEntries(new FormData(e.target).entries()),buy=Number(v.buy),sell=Number(v.sell),qty=Number(v.qty),fee=Number(v.fee||0);if(!v.date||!/^\d{4,5}$/.test(v.code)||!Number.isInteger(qty)||qty<=0||buy<=0||sell<=0||fee<0){alert('日付・銘柄・単価・数量を確認してください');return}const gross=(sell-buy)*qty-fee,withheld=gross>0?Math.round(gross*.20315):0,pnl=Math.round(gross-withheld);if(records.some(r=>r.date===v.date&&String(r.code||'')===v.code)){alert('同じ日・銘柄の正式な取引が既にあります。速報値は登録せず、CSVの正式値を優先してください。');return}if(!confirm(`${v.date} ${v.code}\n買付 ${buy}円 → 売却 ${sell}円 × ${qty}株\n税引前 約${Math.round(gross)}円\n推定税額 ${withheld}円\n税引後速報値 ${pnl}円\n\n※同日・同銘柄の取引をまとめた概算です。保存しますか？`))return;const list=quickEntries().filter(q=>!(q.date===v.date&&q.code===v.code));list.push({id:uid(),date:v.date,code:v.code,name:v.name||'',buy,sell,qty,fee,pnl,created:stamp()});await setmeta('quickEstimates',list);closeSheet();month=ym(v.date);selected=v.date;detail=true;go('calendar');toast('速報値を登録しました')}
 
 init().catch(e=>{$('#main').innerHTML='<section class="card"><h3>保存データを読み込めません</h3><p>既存データを初期化せず、操作を停止しました。</p><button class="btn" onclick="location.reload()">再試行</button><p class="hint">'+esc(e.message)+'</p></section>'});if('serviceWorker'in navigator)navigator.serviceWorker.register('./sw.js').catch(()=>{});
